@@ -436,6 +436,8 @@ Use --merge to merge the sync branch back to main branch.`,
 				result, err := syncbranch.CommitToSyncBranch(ctx, repoRoot, syncBranchName, jsonlPath, !noPush)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error committing to sync branch: %v\n", err)
+					// bd-hlsw.2: Run diagnostic to surface root cause
+					printSyncErrorDiagnostic(runSyncErrorDiagnostic(ctx, jsonlPath))
 					os.Exit(1)
 				}
 				if result.Committed {
@@ -486,6 +488,8 @@ Use --merge to merge the sync branch back to main branch.`,
 					pullResult, err := syncbranch.PullFromSyncBranch(ctx, repoRoot, syncBranchName, jsonlPath, !noPush, requireMassDeleteConfirmation)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error pulling from sync branch: %v\n", err)
+						// bd-hlsw.2: Run diagnostic to surface root cause
+						printSyncErrorDiagnostic(runSyncErrorDiagnostic(ctx, jsonlPath))
 						os.Exit(1)
 					}
 					if pullResult.Pulled {
@@ -585,6 +589,9 @@ Use --merge to merge the sync branch back to main branch.`,
 								fmt.Fprintf(os.Stderr, "Fix: bd doctor --fix\n\n")
 							}
 
+							// bd-hlsw.2: Run diagnostic to surface root cause
+							printSyncErrorDiagnostic(runSyncErrorDiagnostic(ctx, jsonlPath))
+
 							fmt.Fprintf(os.Stderr, "Hint: resolve conflicts manually and run 'bd import' then 'bd sync' again\n")
 							os.Exit(1)
 						}
@@ -638,6 +645,8 @@ Use --merge to merge the sync branch back to main branch.`,
 				fmt.Println("→ Importing updated JSONL...")
 				if err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory, true); err != nil {
 					fmt.Fprintf(os.Stderr, "Error importing: %v\n", err)
+					// bd-hlsw.2: Run diagnostic to surface root cause
+					printSyncErrorDiagnostic(runSyncErrorDiagnostic(ctx, jsonlPath))
 					os.Exit(1)
 				}
 
@@ -655,6 +664,8 @@ Use --merge to merge the sync branch back to main branch.`,
 							}
 							if err := validatePostImportWithExpectedDeletions(beforeCount, afterCount, expectedDeletions, jsonlPath); err != nil {
 								fmt.Fprintf(os.Stderr, "Post-import validation failed: %v\n", err)
+								// bd-hlsw.2: Run diagnostic to surface root cause
+								printSyncErrorDiagnostic(runSyncErrorDiagnostic(ctx, jsonlPath))
 								os.Exit(1)
 							}
 						}
@@ -2387,4 +2398,67 @@ func printOrphanedChildrenResult(oc *OrphanedChildren) {
 		fmt.Println("   [OK] No orphaned children found")
 	}
 	fmt.Println()
+}
+
+// SyncErrorDiagnostic contains diagnostic information when sync fails.
+// bd-hlsw.2: Improve sync error messages
+type SyncErrorDiagnostic struct {
+	ForcedPush     bool
+	PrefixMismatch int
+	OrphanedIssues int
+}
+
+// runSyncErrorDiagnostic runs quick integrity checks to identify the root cause of sync failure.
+// bd-hlsw.2: Called when sync encounters an error to provide actionable suggestions.
+func runSyncErrorDiagnostic(ctx context.Context, jsonlPath string) *SyncErrorDiagnostic {
+	diag := &SyncErrorDiagnostic{}
+
+	// Quick force push check
+	fp := checkForcedPush(ctx)
+	diag.ForcedPush = fp.Detected
+
+	// Quick prefix mismatch check
+	if pm, err := checkPrefixMismatch(ctx, jsonlPath); err == nil && pm != nil {
+		diag.PrefixMismatch = pm.Count
+	}
+
+	// Quick orphaned check
+	if oc, err := checkOrphanedChildrenInJSONL(jsonlPath); err == nil && oc != nil {
+		diag.OrphanedIssues = oc.Count
+	}
+
+	return diag
+}
+
+// printSyncErrorDiagnostic prints actionable suggestions based on diagnostic results.
+// bd-hlsw.2: Provides specific recovery steps based on detected issues.
+func printSyncErrorDiagnostic(diag *SyncErrorDiagnostic) {
+	if diag == nil {
+		return
+	}
+
+	hasIssues := diag.ForcedPush || diag.PrefixMismatch > 0 || diag.OrphanedIssues > 0
+	if !hasIssues {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "\n💡 Diagnostic detected potential issues:\n")
+
+	if diag.ForcedPush {
+		fmt.Fprintf(os.Stderr, "   • Sync branch has DIVERGED from remote (possible force push)\n")
+		fmt.Fprintf(os.Stderr, "     Fix: git fetch origin beads-sync && git reset --hard origin/beads-sync\n")
+		fmt.Fprintf(os.Stderr, "     Or: bd sync --from-main (to reset from main branch)\n")
+	}
+
+	if diag.PrefixMismatch > 0 {
+		fmt.Fprintf(os.Stderr, "   • Found %d issue(s) with mismatched prefix\n", diag.PrefixMismatch)
+		fmt.Fprintf(os.Stderr, "     Fix: bd import --rename-on-import (rename to match configured prefix)\n")
+	}
+
+	if diag.OrphanedIssues > 0 {
+		fmt.Fprintf(os.Stderr, "   • Found %d orphaned issue(s) with missing parent\n", diag.OrphanedIssues)
+		fmt.Fprintf(os.Stderr, "     Fix: bd delete <issue-id> (to remove orphaned issues)\n")
+	}
+
+	fmt.Fprintf(os.Stderr, "\n   Run 'bd sync --check' for detailed diagnostic\n\n")
 }
