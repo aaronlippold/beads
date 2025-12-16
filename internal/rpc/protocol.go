@@ -81,6 +81,7 @@ type UpdateArgs struct {
 	Description        *string  `json:"description,omitempty"`
 	Status             *string  `json:"status,omitempty"`
 	Priority           *int     `json:"priority,omitempty"`
+	IssueType          *string  `json:"issue_type,omitempty"` // GH#522: type change
 	Design             *string  `json:"design,omitempty"`
 	AcceptanceCriteria *string  `json:"acceptance_criteria,omitempty"`
 	Notes              *string  `json:"notes,omitempty"`

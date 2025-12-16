@@ -506,6 +506,16 @@ var updateCmd = &cobra.Command{
 			externalRef, _ := cmd.Flags().GetString("external-ref")
 			updates["external_ref"] = externalRef
 		}
+		if cmd.Flags().Changed("type") {
+			issueType, _ := cmd.Flags().GetString("type")
+			// Validate the issue type
+			it := types.IssueType(issueType)
+			if !it.IsValid() {
+				fmt.Fprintf(os.Stderr, "Error: invalid issue type: %s (valid: task, bug, feature, epic, chore)\n", issueType)
+				os.Exit(1)
+			}
+			updates["issue_type"] = issueType
+		}
 		if cmd.Flags().Changed("estimate") {
 			estimate, _ := cmd.Flags().GetInt("estimate")
 			if estimate < 0 {
@@ -593,6 +603,9 @@ var updateCmd = &cobra.Command{
 				}
 				if externalRef, ok := updates["external_ref"].(string); ok {
 					updateArgs.ExternalRef = &externalRef
+				}
+				if issueType, ok := updates["issue_type"].(string); ok {
+					updateArgs.IssueType = &issueType
 				}
 				if estimate, ok := updates["estimated_minutes"].(int); ok {
 					updateArgs.EstimatedMinutes = &estimate
@@ -1019,6 +1032,7 @@ func init() {
 	updateCmd.Flags().StringP("status", "s", "", "New status")
 	registerPriorityFlag(updateCmd, "")
 	updateCmd.Flags().String("title", "", "New title")
+	updateCmd.Flags().StringP("type", "t", "", "Issue type (task, bug, feature, epic, chore)")
 	registerCommonIssueFlags(updateCmd)
 	updateCmd.Flags().String("notes", "", "Additional notes")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")

@@ -70,6 +70,9 @@ func updatesFromArgs(a UpdateArgs) map[string]interface{} {
 	if a.ExternalRef != nil {
 		u["external_ref"] = *a.ExternalRef
 	}
+	if a.IssueType != nil {
+		u["issue_type"] = *a.IssueType
+	}
 	if a.EstimatedMinutes != nil {
 		u["estimated_minutes"] = *a.EstimatedMinutes
 	}
