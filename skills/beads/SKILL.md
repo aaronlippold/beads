@@ -104,6 +104,74 @@ Working on auth. Made some progress. More to do.
 
 **For complete compaction recovery workflow, read:** [references/WORKFLOWS.md](references/WORKFLOWS.md#compaction-survival)
 
+### Recovery Card Pattern
+
+**Recommended practice**: Maintain a standardized recovery card for quick context restoration.
+
+**Recovery Card Convention:**
+- **Title**: `RECOVERY: Current Session Context` (always this exact title for consistency)
+- **Status**: `in_progress` (appears in `bd ready` output)
+- **Priority**: P0 (highest priority to ensure visibility)
+- **Content**: Detailed session context in notes field
+
+**When to use:**
+- Before compaction (ensure recovery card exists and is updated)
+- Before ending long sessions
+- When approaching token limits
+- When switching between projects
+
+**Creating/Updating recovery card:**
+```bash
+# Check if recovery card exists
+bd list --status in_progress | grep -i "RECOVERY:"
+
+# Create if doesn't exist
+bd create "RECOVERY: Current Session Context" -p 0
+bd update <new-id> --status in_progress
+
+# Update existing card
+bd update <recovery-id> --notes "$(cat <<'EOF'
+Context from [DATE]:
+
+COMPLETED THIS SESSION:
+- [Major accomplishment 1]
+- [Major accomplishment 2]
+
+IN PROGRESS:
+- [Current task] - Run: bd show <task-id>
+
+GIT STATUS:
+- Branch: [branch-name]
+- Commits ahead: [number]
+- Uncommitted changes: [list key files]
+
+NEXT STEPS:
+1. [Immediate next action]
+2. [Following action]
+
+BLOCKERS/NOTES:
+- [Critical context for continuation]
+EOF
+)"
+```
+
+**Session restoration workflow:**
+```bash
+# After compaction or returning to project
+bd ready                          # Recovery card appears first (P0, in_progress)
+bd show <recovery-card-id>        # Read full context
+bd close <recovery-card-id> --reason "Context restored"
+bd ready                          # Continue with next task
+```
+
+**Benefits:**
+- Explicit next steps (no guessing where to resume)
+- Git status preserved (uncommitted changes documented)
+- Blockers and decisions captured
+- Single source of truth for session state
+
+**See also:** `examples/recovery-card-workflow.md` for complete example
+
 ## Session Start Protocol
 
 **bd is available when:**
