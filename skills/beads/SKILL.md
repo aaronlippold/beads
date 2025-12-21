@@ -110,8 +110,8 @@ Working on auth. Made some progress. More to do.
 
 **Recovery Card Convention:**
 - **Title**: `RECOVERY: Current Session Context` (always this exact title for consistency)
-- **Status**: `in_progress` (appears in `bd ready` output)
-- **Priority**: P0 (highest priority to ensure visibility)
+- **Status**: `open` (appears in `bd ready` output - in_progress hides it)
+- **Priority**: P0 (highest priority to ensure it appears first)
 - **Content**: Detailed session context in notes field
 
 **When to use:**
@@ -123,11 +123,10 @@ Working on auth. Made some progress. More to do.
 **Creating/Updating recovery card:**
 ```bash
 # Check if recovery card exists
-bd list --status in_progress | grep -i "RECOVERY:"
+bd list | grep -i "RECOVERY:"
 
-# Create if doesn't exist
+# Create if doesn't exist (status defaults to open, which is correct for bd ready)
 bd create "RECOVERY: Current Session Context" -p 0
-bd update <new-id> --status in_progress
 
 # Update existing card
 bd update <recovery-id> --notes "$(cat <<'EOF'

@@ -8,7 +8,7 @@ You're working on Vulcan v2.3.0 stabilization. You need to compact due to low co
 
 ```bash
 # Check for existing recovery card
-bd list --status in_progress | grep -i recovery
+bd list | grep -i "RECOVERY:"
 
 # Update the recovery card (vulcan-clean-4rp exists)
 bd update vulcan-clean-4rp --description "$(cat <<'EOF'
@@ -73,7 +73,7 @@ Read it, follow its instructions, then close it when ready to continue.
 ```bash
 # 1. Check for recovery card
 bd ready
-# Output shows: vulcan-clean-4rp: RECOVERY: Current Session Context [P0 - in_progress]
+# Output shows: vulcan-clean-4rp: RECOVERY: Current Session Context [P0 - open]
 
 # 2. Read the card
 bd show vulcan-clean-4rp

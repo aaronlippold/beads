@@ -54,10 +54,10 @@ case "$EVENT" in
 
   "pre-compact")
     # Before compact, verify recovery card exists
-    if ! bd list --status in_progress 2>/dev/null | grep -q "RECOVERY:"; then
+    if ! bd list 2>/dev/null | grep -q "RECOVERY:"; then
       echo "⚠️  WARNING: No recovery card found!"
       echo "   Create one with: bd create 'RECOVERY: Current Session Context' -p 0"
-      echo "   Then: bd update <id> --status in_progress"
+      echo "   (Keep status 'open' so it appears in bd ready)"
       exit 1
     fi
 
