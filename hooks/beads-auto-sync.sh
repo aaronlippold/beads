@@ -3,8 +3,9 @@
 # Beads Auto-Sync Hook for Claude Code
 #
 # This hook automatically syncs beads when appropriate events occur.
-# Triggers: post-commit, session-end
+# Triggers: post-commit, session-end, pre-compact
 #
+# Companion: beads-context-monitor.sh (monitors token usage thresholds)
 # Installation: Place in ~/.claude/hooks/ and configure in settings
 
 set -euo pipefail
