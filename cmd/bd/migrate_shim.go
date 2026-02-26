@@ -265,46 +265,79 @@ func extractViaSQLiteCLI(_ context.Context, dbPath string) (*migrationData, erro
 	issueCols := queryColumnSet(dbPath, "issues")
 	depCols := queryColumnSet(dbPath, "dependencies")
 
-	specIDExpr := sqliteOptionalTextExpr(issueCols, "spec_id", "''")
-	closedBySessionExpr := sqliteOptionalTextExpr(issueCols, "closed_by_session", "''")
-	wispTypeExpr := sqliteOptionalTextExpr(issueCols, "wisp_type", "''")
-	metadataExpr := sqliteOptionalTextExpr(issueCols, "metadata", "'{}'")
+	// All columns that may be missing in older beads database schemas.
+	// Uses sqliteOptionalTextExpr which checks PRAGMA table_info before querying.
+	// Fixes "no such column" errors for pre-v0.49 databases (GH#2016).
+	opt := func(col, fallback string) string {
+		return sqliteOptionalTextExpr(issueCols, col, fallback)
+	}
 
 	// Extract issues
 	issueQuery := fmt.Sprintf(`
-		SELECT id, COALESCE(content_hash,'') as content_hash,
-			COALESCE(title,'') as title, COALESCE(description,'') as description,
-			COALESCE(design,'') as design, COALESCE(acceptance_criteria,'') as acceptance_criteria,
-			COALESCE(notes,'') as notes,
-			COALESCE(status,'') as status, COALESCE(priority,0) as priority,
-			COALESCE(issue_type,'') as issue_type,
-			COALESCE(assignee,'') as assignee, estimated_minutes,
-			COALESCE(created_at,'') as created_at, COALESCE(created_by,'') as created_by,
-			COALESCE(owner,'') as owner,
-			COALESCE(updated_at,'') as updated_at, closed_at, external_ref, %s as spec_id,
-			COALESCE(compaction_level,0) as compaction_level,
-			COALESCE(compacted_at,'') as compacted_at, compacted_at_commit,
-			COALESCE(original_size,0) as original_size,
-			COALESCE(sender,'') as sender, COALESCE(ephemeral,0) as ephemeral, %s as wisp_type,
-			COALESCE(pinned,0) as pinned,
-			COALESCE(is_template,0) as is_template, COALESCE(crystallizes,0) as crystallizes,
-			COALESCE(mol_type,'') as mol_type, COALESCE(work_type,'') as work_type,
-			quality_score,
-			COALESCE(source_system,'') as source_system, COALESCE(source_repo,'') as source_repo,
-			COALESCE(close_reason,'') as close_reason, %s as closed_by_session,
-			COALESCE(event_kind,'') as event_kind, COALESCE(actor,'') as actor,
-			COALESCE(target,'') as target, COALESCE(payload,'') as payload,
-			COALESCE(await_type,'') as await_type, COALESCE(await_id,'') as await_id,
-			COALESCE(timeout_ns,0) as timeout_ns, COALESCE(waiters,'') as waiters,
-			COALESCE(hook_bead,'') as hook_bead, COALESCE(role_bead,'') as role_bead,
-			COALESCE(agent_state,'') as agent_state,
-			COALESCE(last_activity,'') as last_activity, COALESCE(role_type,'') as role_type,
-			COALESCE(rig,'') as rig,
-			COALESCE(due_at,'') as due_at, COALESCE(defer_until,'') as defer_until,
+		SELECT id, %s as content_hash,
+			%s as title, %s as description,
+			%s as design, %s as acceptance_criteria,
+			%s as notes,
+			%s as status, %s as priority,
+			%s as issue_type,
+			%s as assignee, %s as estimated_minutes,
+			%s as created_at, %s as created_by,
+			%s as owner,
+			%s as updated_at, %s as closed_at, %s as external_ref, %s as spec_id,
+			%s as compaction_level,
+			%s as compacted_at, %s as compacted_at_commit,
+			%s as original_size,
+			%s as sender, %s as ephemeral, %s as wisp_type,
+			%s as pinned,
+			%s as is_template, %s as crystallizes,
+			%s as mol_type, %s as work_type,
+			%s as quality_score,
+			%s as source_system, %s as source_repo,
+			%s as close_reason, %s as closed_by_session,
+			%s as event_kind, %s as actor,
+			%s as target, %s as payload,
+			%s as await_type, %s as await_id,
+			%s as timeout_ns, %s as waiters,
+			%s as hook_bead, %s as role_bead,
+			%s as agent_state,
+			%s as last_activity, %s as role_type,
+			%s as rig,
+			%s as due_at, %s as defer_until,
 			%s as metadata
 		FROM issues
 		ORDER BY created_at, id
-	`, specIDExpr, wispTypeExpr, closedBySessionExpr, metadataExpr)
+	`,
+		opt("content_hash", "''"),
+		opt("title", "''"), opt("description", "''"),
+		opt("design", "''"), opt("acceptance_criteria", "''"),
+		opt("notes", "''"),
+		opt("status", "''"), opt("priority", "0"),
+		opt("issue_type", "''"),
+		opt("assignee", "''"), opt("estimated_minutes", "NULL"),
+		opt("created_at", "''"), opt("created_by", "''"),
+		opt("owner", "''"),
+		opt("updated_at", "''"), opt("closed_at", "NULL"), opt("external_ref", "NULL"), opt("spec_id", "''"),
+		opt("compaction_level", "0"),
+		opt("compacted_at", "''"), opt("compacted_at_commit", "NULL"),
+		opt("original_size", "0"),
+		opt("sender", "''"), opt("ephemeral", "0"), opt("wisp_type", "''"),
+		opt("pinned", "0"),
+		opt("is_template", "0"), opt("crystallizes", "0"),
+		opt("mol_type", "''"), opt("work_type", "''"),
+		opt("quality_score", "NULL"),
+		opt("source_system", "''"), opt("source_repo", "''"),
+		opt("close_reason", "''"), opt("closed_by_session", "''"),
+		opt("event_kind", "''"), opt("actor", "''"),
+		opt("target", "''"), opt("payload", "''"),
+		opt("await_type", "''"), opt("await_id", "''"),
+		opt("timeout_ns", "0"), opt("waiters", "''"),
+		opt("hook_bead", "''"), opt("role_bead", "''"),
+		opt("agent_state", "''"),
+		opt("last_activity", "''"), opt("role_type", "''"),
+		opt("rig", "''"),
+		opt("due_at", "''"), opt("defer_until", "''"),
+		opt("metadata", "'{}'"),
+	)
 	issueRows, err := queryJSON(dbPath, issueQuery)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query issues: %w", err)
@@ -331,14 +364,15 @@ func extractViaSQLiteCLI(_ context.Context, dbPath string) (*migrationData, erro
 
 	// Extract dependencies
 	depsMap := make(map[string][]*types.Dependency)
-	depMetadataExpr := sqliteOptionalTextExpr(depCols, "metadata", "'{}'")
-	depThreadExpr := sqliteOptionalTextExpr(depCols, "thread_id", "''")
+	depOpt := func(col, fallback string) string {
+		return sqliteOptionalTextExpr(depCols, col, fallback)
+	}
 	depQuery := fmt.Sprintf(`
-		SELECT issue_id, depends_on_id, COALESCE(type,'') as type, COALESCE(created_by,'') as created_by, COALESCE(created_at,'') as created_at,
+		SELECT issue_id, depends_on_id, COALESCE(type,'') as type, %s as created_by, COALESCE(created_at,'') as created_at,
 			%s as metadata, %s as thread_id
 		FROM dependencies
 		ORDER BY created_at, issue_id, depends_on_id
-	`, depMetadataExpr, depThreadExpr)
+	`, depOpt("created_by", "''"), depOpt("metadata", "'{}'"), depOpt("thread_id", "''"))
 	depRows, err := queryJSON(dbPath, depQuery)
 	if err == nil {
 		for _, row := range depRows {

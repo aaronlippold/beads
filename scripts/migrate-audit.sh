@@ -158,7 +158,21 @@ while IFS= read -r beads_dir; do
 
     # SQLite backend (empty or explicit "sqlite")
     if [[ -f "$beads_dir/beads.db" ]]; then
+        # Check if beads.db is a valid SQLite database (not empty/corrupt)
+        file_size=$(stat -f%z "$beads_dir/beads.db" 2>/dev/null || stat -c%s "$beads_dir/beads.db" 2>/dev/null || echo "0")
+        if [[ "$file_size" == "0" ]]; then
+            printf "${YELLOW}?${NC}  %-35s empty beads.db (0 bytes)\n" "$project"
+            empty_boards=$((empty_boards + 1))
+            continue
+        fi
+
         issue_count=$(sqlite3 "$beads_dir/beads.db" "SELECT COUNT(*) FROM issues;" 2>/dev/null || echo "err")
+        if [[ "$issue_count" == "err" ]]; then
+            printf "${YELLOW}?${NC}  %-35s corrupt or unreadable beads.db\n" "$project"
+            empty_boards=$((empty_boards + 1))
+            continue
+        fi
+
         has_owner=$(sqlite3 "$beads_dir/beads.db" "PRAGMA table_info(issues);" 2>/dev/null | grep -c "owner" || echo "0")
 
         schema_status="current"
