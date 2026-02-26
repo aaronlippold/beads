@@ -13,7 +13,7 @@ const ConfigFileName = "metadata.json"
 
 type Config struct {
 	Database string `json:"database"`
-	Backend  string `json:"backend,omitempty"` // always "dolt"
+	Backend  string `json:"backend,omitempty"` // "dolt" (default) or "sqlite"
 
 	// Deletions configuration
 	DeletionsRetentionDays int `json:"deletions_retention_days,omitempty"` // 0 means use default (3 days)
@@ -109,12 +109,20 @@ func (c *Config) Save(beadsDir string) error {
 }
 
 func (c *Config) DatabasePath(beadsDir string) string {
-	// Always use "dolt" as the directory name.
-	// The Database field is irrelevant — data always lives at .beads/dolt/.
-	// Stale values like "town", "wyvern", "beads_rig" caused split-brain (see DOLT-HEALTH-P0.md).
 	if filepath.IsAbs(c.Database) {
 		return c.Database
 	}
+	// For SQLite backend, return the SQLite database path.
+	// Fixes GH#2016: SQLite users must not be forced to Dolt.
+	if c.GetBackend() == BackendSQLite {
+		db := c.Database
+		if db == "" {
+			db = "beads.db"
+		}
+		return filepath.Join(beadsDir, db)
+	}
+	// For Dolt backend, always use "dolt" as the directory name.
+	// Stale values like "town", "wyvern", "beads_rig" caused split-brain (see DOLT-HEALTH-P0.md).
 	return filepath.Join(beadsDir, "dolt")
 }
 
@@ -140,7 +148,8 @@ func (c *Config) GetStaleClosedIssuesDays() int {
 
 // Backend constants
 const (
-	BackendDolt = "dolt"
+	BackendDolt   = "dolt"
+	BackendSQLite = "sqlite"
 )
 
 // BackendCapabilities describes behavioral constraints for a storage backend.
@@ -165,6 +174,8 @@ type BackendCapabilities struct {
 // handle server mode (which supports multi-process access).
 func CapabilitiesForBackend(backend string) BackendCapabilities {
 	switch strings.TrimSpace(strings.ToLower(backend)) {
+	case BackendSQLite:
+		return BackendCapabilities{SingleProcessOnly: true}
 	case "", BackendDolt:
 		// Default to single-process-only; server mode overrides via Config.GetCapabilities().
 		return BackendCapabilities{SingleProcessOnly: true}
@@ -185,9 +196,28 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 	return CapabilitiesForBackend(backend)
 }
 
-// GetBackend returns the configured backend type (always Dolt).
+// GetBackend returns the configured backend type.
+// Priority: BEADS_BACKEND env var > Backend field in metadata.json > default (dolt).
+// Fixes GH#2016: existing SQLite databases must be respected.
 func (c *Config) GetBackend() string {
-	return BackendDolt
+	// Env var override — escape hatch for corrupted configs
+	if env := os.Getenv("BEADS_BACKEND"); env != "" {
+		switch strings.ToLower(env) {
+		case BackendSQLite:
+			return BackendSQLite
+		case BackendDolt:
+			return BackendDolt
+		default:
+			fmt.Fprintf(os.Stderr, "Warning: BEADS_BACKEND=%q is not a recognized backend (use 'sqlite' or 'dolt'), ignoring\n", env)
+		}
+	}
+	// Normalize config field (handles hand-edited metadata.json with "SQLite", "SQLITE", etc.)
+	switch strings.ToLower(c.Backend) {
+	case BackendSQLite:
+		return BackendSQLite
+	default:
+		return BackendDolt
+	}
 }
 
 // Dolt mode constants
