@@ -359,8 +359,27 @@ func TestFinalizeMigration_WritesConfigYaml(t *testing.T) {
 	if !strings.Contains(string(data), "sync") {
 		t.Errorf("config.yaml should contain sync.mode key, got: %s", data)
 	}
-	if !strings.Contains(string(data), "dolt") {
-		t.Errorf("config.yaml should contain dolt value for sync.mode, got: %s", data)
+	if !strings.Contains(string(data), "dolt-native") {
+		t.Errorf("config.yaml should contain dolt-native value for sync.mode, got: %s", data)
+	}
+}
+
+func TestFinalizeMigration_WritesDoltNativeSyncMode(t *testing.T) {
+	_, beadsDir, sqlitePath := setupBeadsDir(t)
+
+	if err := finalizeMigration(beadsDir, sqlitePath, "testdb"); err != nil {
+		t.Fatalf("finalizeMigration failed: %v", err)
+	}
+
+	configYaml := filepath.Join(beadsDir, "config.yaml")
+	data, err := os.ReadFile(configYaml)
+	if err != nil {
+		t.Fatalf("reading config.yaml: %v", err)
+	}
+
+	// Must write "dolt-native", NOT "dolt" (which is not a valid sync.mode)
+	if !strings.Contains(string(data), "dolt-native") {
+		t.Errorf("config.yaml should contain sync.mode=dolt-native, got: %s", data)
 	}
 }
 

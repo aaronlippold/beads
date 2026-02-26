@@ -96,6 +96,11 @@ func SQLiteResidue(path string) error {
 		return fmt.Errorf("beads.db not found — nothing to clean up")
 	}
 
+	// Don't overwrite an existing .migrated file from a previous migration attempt
+	if _, err := os.Stat(migratedPath); err == nil {
+		return fmt.Errorf("beads.db.migrated already exists — remove or move it first, then re-run 'bd doctor --fix'")
+	}
+
 	if err := os.Rename(sqlitePath, migratedPath); err != nil {
 		return fmt.Errorf("failed to rename beads.db: %w", err)
 	}

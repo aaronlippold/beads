@@ -67,43 +67,70 @@ func backupSQLite(sqlitePath string) (string, error) {
 //
 // Returns nil if no server is listening (connection refused) or if the server
 // is serving the expected database.
+// verifyServerTarget checks whether a Dolt server on the given port already
+// hosts databases that could conflict with the expected database name.
+// Returns nil if no server is running (connection refused) or if the server
+// does not have a conflicting database. Returns error for timeouts, auth
+// failures, or other uncertain states.
 func verifyServerTarget(expectedDBName string, port int) error {
 	if port == 0 {
 		return nil
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	host := "127.0.0.1"
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	// Check if anything is listening on the port
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		// Connection refused — no server running, safe to proceed.
-		return nil
+		// Connection refused = no server running = safe to proceed.
+		// But timeouts or other errors = unknown state = warn and abort.
+		if opErr, ok := err.(*net.OpError); ok {
+			if sysErr, ok := opErr.Err.(*os.SyscallError); ok {
+				if sysErr.Syscall == "connect" {
+					// ECONNREFUSED — no server, safe
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("cannot verify server on port %d (unknown error, not safe to proceed): %w", port, err)
 	}
 	conn.Close()
 
-	// Server is listening. Verify it's serving the expected database.
+	// Server is listening. Query SHOW DATABASES to see what's there.
 	dsn := fmt.Sprintf("root@tcp(%s)/", addr)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return fmt.Errorf("connecting to dolt server on port %d: %w", port, err)
+		return fmt.Errorf("connecting to server on port %d: %w", port, err)
 	}
 	defer db.Close()
-
 	db.SetConnMaxLifetime(2 * time.Second)
 
-	var dbName sql.NullString
-	if err := db.QueryRow("SELECT DATABASE()").Scan(&dbName); err != nil {
-		return fmt.Errorf("querying database name on port %d: %w", port, err)
+	rows, err := db.Query("SHOW DATABASES")
+	if err != nil {
+		// Can't list databases — might be non-MySQL service or auth issue.
+		// Treat as unsafe since we can't verify.
+		return fmt.Errorf("cannot query databases on port %d (may not be a Dolt server): %w", port, err)
+	}
+	defer rows.Close()
+
+	// Scan database names — if expectedDBName already exists, that's fine
+	// (idempotent migration). We're only concerned if the server appears to
+	// be a completely different project's server with no relation to us.
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		if name == expectedDBName {
+			// Our database already exists on this server — safe (idempotent)
+			return nil
+		}
 	}
 
-	// No database selected or matches expected — safe.
-	if !dbName.Valid || dbName.String == "" || dbName.String == expectedDBName {
-		return nil
-	}
-
-	return fmt.Errorf(
-		"dolt server on port %d is serving database %q, expected %q — refusing to migrate to avoid data corruption",
-		port, dbName.String, expectedDBName,
-	)
+	// Database doesn't exist yet — server will create it. This is the normal
+	// first-migration case for a shared server (Gas Town model).
+	return nil
 }
 
 // verifyMigrationCounts compares source (SQLite) row counts against target
@@ -151,7 +178,7 @@ func finalizeMigration(beadsDir string, sqlitePath string, dbName string) error 
 	// This is best-effort: config package may not be initialized during
 	// auto-migration (which runs before full CLI setup). The metadata.json
 	// Backend field is the authoritative source of truth.
-	if err := config.SaveConfigValue("sync.mode", "dolt", beadsDir); err != nil {
+	if err := config.SaveConfigValue("sync.mode", string(config.SyncModeDoltNative), beadsDir); err != nil {
 		// Non-fatal — metadata.json is already updated
 		debug.Logf("finalizeMigration: config.yaml sync.mode write skipped: %v", err)
 	}

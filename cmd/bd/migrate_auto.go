@@ -132,14 +132,24 @@ func doAutoMigrateSQLiteToDolt(beadsDir string) {
 		dbName = data.prefix
 	}
 
-	// Verify server target — don't write to the wrong Dolt server
-	serverPort := doltserver.DefaultConfig(beadsDir).Port
+	// Resolve server connection settings once — used for both verification and import
+	resolvedPort := doltserver.DefaultConfig(beadsDir).Port
+	resolvedHost := "127.0.0.1"
+	resolvedUser := "root"
+	resolvedPassword := ""
+	resolvedTLS := false
 	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
+		resolvedHost = cfg.GetDoltServerHost()
 		if cfg.DoltServerPort > 0 {
-			serverPort = cfg.DoltServerPort
+			resolvedPort = cfg.DoltServerPort
 		}
+		resolvedUser = cfg.GetDoltServerUser()
+		resolvedPassword = cfg.GetDoltServerPassword()
+		resolvedTLS = cfg.GetDoltServerTLS()
 	}
-	if err := verifyServerTarget(dbName, serverPort); err != nil {
+
+	// Verify server target — don't write to the wrong Dolt server
+	if err := verifyServerTarget(dbName, resolvedPort); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: SQLite auto-migration aborted (server check): %v\n", err)
 		fmt.Fprintf(os.Stderr, "\nTo fix:\n")
 		fmt.Fprintf(os.Stderr, "  1. Stop the other project's Dolt server\n")
@@ -151,19 +161,16 @@ func doAutoMigrateSQLiteToDolt(beadsDir string) {
 	// Save original config for rollback
 	originalCfg, _ := configfile.Load(beadsDir)
 
-	// Phase 2: Create Dolt store and import
-	// doltPath already declared above (dolt-exists check)
+	// Phase 2: Create Dolt store and import — use same resolved settings as verification
 	doltPath = filepath.Join(beadsDir, "dolt")
 	doltCfg := &dolt.Config{
-		Path:     doltPath,
-		Database: dbName,
-	}
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		doltCfg.ServerHost = cfg.GetDoltServerHost()
-		doltCfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
-		doltCfg.ServerUser = cfg.GetDoltServerUser()
-		doltCfg.ServerPassword = cfg.GetDoltServerPassword()
-		doltCfg.ServerTLS = cfg.GetDoltServerTLS()
+		Path:           doltPath,
+		Database:       dbName,
+		ServerHost:     resolvedHost,
+		ServerPort:     resolvedPort,
+		ServerUser:     resolvedUser,
+		ServerPassword: resolvedPassword,
+		ServerTLS:      resolvedTLS,
 	}
 
 	fmt.Fprintf(os.Stderr, "Creating Dolt database...\n")
