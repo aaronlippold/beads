@@ -3,6 +3,7 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -16,6 +17,13 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 	// Route to wisp_dependencies if the issue is an active wisp
 	if s.isActiveWisp(ctx, dep.IssueID) {
 		return s.addWispDependency(ctx, dep, actor)
+	}
+
+	// Pre-transaction: check if target is a wisp (must be done before opening tx
+	// to avoid connection pool deadlock with embedded dolt — bd-w2w)
+	targetIsWisp := false
+	if !strings.HasPrefix(dep.DependsOnID, "external:") {
+		targetIsWisp = s.isActiveWisp(ctx, dep.DependsOnID)
 	}
 
 	metadata := dep.Metadata
@@ -39,9 +47,15 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 	}
 
 	// Validate that the target issue exists (skip for external cross-rig references)
+	// Check wisps table if target is an active wisp (bd-w2w)
 	if !strings.HasPrefix(dep.DependsOnID, "external:") {
 		var targetExists int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE id = ?`, dep.DependsOnID).Scan(&targetExists); err != nil {
+		targetTable := "issues"
+		if targetIsWisp {
+			targetTable = "wisps"
+		}
+		//nolint:gosec // G201: targetTable is hardcoded to "issues" or "wisps"
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, targetTable), dep.DependsOnID).Scan(&targetExists); err != nil {
 			return fmt.Errorf("failed to check target issue existence: %w", err)
 		}
 		if targetExists == 0 {
@@ -51,6 +65,8 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 
 	// Cycle detection for blocking dependency types: check if adding this edge
 	// would create a cycle by seeing if depends_on_id can already reach issue_id.
+	// UNIONs both dependencies and wisp_dependencies to detect cross-table cycles
+	// (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)
 	if dep.Type == types.DepBlocks {
 		var reachable int
 		if err := tx.QueryRowContext(ctx, `
@@ -59,9 +75,12 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 				UNION ALL
 				SELECT d.depends_on_id, r.depth + 1
 				FROM reachable r
-				JOIN dependencies d ON d.issue_id = r.node
-				WHERE d.type = 'blocks'
-				  AND r.depth < 100
+				JOIN (
+					SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'
+					UNION ALL
+					SELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'
+				) d ON d.issue_id = r.node
+				WHERE r.depth < 100
 			)
 			SELECT COUNT(*) FROM reachable WHERE node = ?
 		`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
@@ -83,15 +102,25 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 	if err == nil {
 		// Row exists
 		if existingType == string(dep.Type) {
-			// Same type — idempotent, nothing to do
-			return tx.Commit()
+			// Same type — idempotent; update metadata in case it changed
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE dependencies SET metadata = ? WHERE issue_id = ? AND depends_on_id = ?
+			`, metadata, dep.IssueID, dep.DependsOnID); err != nil {
+				return fmt.Errorf("failed to update dependency metadata: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("sql commit: %w", err)
+			}
+			// Record in Dolt version history (bd-2avi)
+			if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+				"dependency: update metadata "+dep.IssueID+" -> "+dep.DependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+				return fmt.Errorf("dolt commit: %w", err)
+			}
+			return nil
 		}
 		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
 			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
-	}
-	// err is non-nil: either sql.ErrNoRows (no existing dep, proceed with insert)
-	// or a real database error. Only sql.ErrNoRows is acceptable here.
-	if err != nil && err != sql.ErrNoRows {
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing dependency: %w", err)
 	}
 
@@ -103,7 +132,15 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 	}
 
 	s.invalidateBlockedIDsCache()
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sql commit: %w", err)
+	}
+	// Record in Dolt version history (bd-2avi)
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		"dependency: add "+string(dep.Type)+" "+dep.IssueID+" -> "+dep.DependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+	return nil
 }
 
 // RemoveDependency removes a dependency between two issues.
@@ -127,7 +164,15 @@ func (s *DoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID s
 	}
 
 	s.invalidateBlockedIDsCache()
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sql commit: %w", err)
+	}
+	// Record in Dolt version history (bd-2avi)
+	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?, '--author', ?)",
+		"dependency: remove "+issueID+" -> "+dependsOnID, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
+		return fmt.Errorf("dolt commit: %w", err)
+	}
+	return nil
 }
 
 // GetDependencies retrieves issues that this issue depends on
@@ -674,17 +719,32 @@ func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, dep
 	return nodes, nil
 }
 
-// DetectCycles finds circular dependencies
+// DetectCycles finds circular dependencies.
+// Queries both dependencies and wisp_dependencies tables to detect cross-table
+// cycles (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)
 func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) {
-	// Get all dependencies
+	// Get all permanent dependencies
 	deps, err := s.GetAllDependencyRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build adjacency list
+	// Get all wisp dependencies
+	wispDeps, err := s.getAllWispDependencyRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build adjacency list from both tables
 	graph := make(map[string][]string)
 	for issueID, records := range deps {
+		for _, dep := range records {
+			if dep.Type == types.DepBlocks {
+				graph[issueID] = append(graph[issueID], dep.DependsOnID)
+			}
+		}
+	}
+	for issueID, records := range wispDeps {
 		for _, dep := range records {
 			if dep.Type == types.DepBlocks {
 				graph[issueID] = append(graph[issueID], dep.DependsOnID)

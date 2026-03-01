@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -127,11 +128,11 @@ func scanIssueFromTable(ctx context.Context, db *sql.DB, table, id string) (*typ
 // recordEventInTable records an event in the specified events table.
 //
 //nolint:gosec // G201: table is a hardcoded constant from wispEventTable
-func recordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
+func recordEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, newValue string) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
 		VALUES (?, ?, ?, ?, ?)
-	`, table), issueID, eventType, actor, oldValue, newValue)
+	`, table), issueID, eventType, actor, "", newValue)
 	return wrapExecError("record event in table", err)
 }
 
@@ -313,7 +314,7 @@ func (s *DoltStore) createWisp(ctx context.Context, issue *types.Issue, actor st
 		return fmt.Errorf("failed to insert wisp: %w", err)
 	}
 
-	if err := recordEventInTable(ctx, tx, "wisp_events", issue.ID, types.EventCreated, actor, "", ""); err != nil {
+	if err := recordEventInTable(ctx, tx, "wisp_events", issue.ID, types.EventCreated, actor, ""); err != nil {
 		return fmt.Errorf("failed to record creation event: %w", err)
 	}
 
@@ -323,22 +324,20 @@ func (s *DoltStore) createWisp(ctx context.Context, issue *types.Issue, actor st
 // getWisp retrieves an issue from the wisps table.
 func (s *DoltStore) getWisp(ctx context.Context, id string) (*types.Issue, error) {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	issue, err := scanIssueFromTable(ctx, s.db, "wisps", id)
 	if err != nil {
-		s.mu.RUnlock()
 		return nil, err
 	}
-	if issue != nil {
-		labels, err := s.getWispLabels(ctx, id)
-		s.mu.RUnlock()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get wisp labels: %w", err)
-		}
-		issue.Labels = labels
-		return issue, nil
+	if issue == nil {
+		return nil, nil
 	}
-	s.mu.RUnlock()
-	return nil, nil
+	labels, err := s.getWispLabels(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get wisp labels: %w", err)
+	}
+	issue.Labels = labels
+	return issue, nil
 }
 
 // getWispLabels retrieves labels from the wisp_labels table.
@@ -381,7 +380,10 @@ func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[strin
 		}
 		setClauses = append(setClauses, fmt.Sprintf("`%s` = ?", columnName))
 		if key == "waiters" {
-			waitersJSON, _ := json.Marshal(value)
+			waitersJSON, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("invalid waiters: %w", err)
+			}
 			args = append(args, string(waitersJSON))
 		} else if key == "metadata" {
 			metadataStr, err := storage.NormalizeMetadataValue(value)
@@ -434,7 +436,7 @@ func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, act
 		return fmt.Errorf("wisp not found: %s", id)
 	}
 
-	if err := recordEventInTable(ctx, tx, "wisp_events", id, types.EventClosed, actor, "", reason); err != nil {
+	if err := recordEventInTable(ctx, tx, "wisp_events", id, types.EventClosed, actor, reason); err != nil {
 		return fmt.Errorf("failed to record event: %w", err)
 	}
 
@@ -510,7 +512,7 @@ func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) erro
 		return fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, currentAssignee)
 	}
 
-	if err := recordEventInTable(ctx, tx, "wisp_events", id, "claimed", actor, "", ""); err != nil {
+	if err := recordEventInTable(ctx, tx, "wisp_events", id, "claimed", actor, ""); err != nil {
 		return fmt.Errorf("failed to record claim event: %w", err)
 	}
 
@@ -522,220 +524,9 @@ func (s *DoltStore) searchWisps(ctx context.Context, query string, filter types.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	whereClauses := []string{}
-	args := []interface{}{}
-
-	if query != "" {
-		whereClauses = append(whereClauses, "(title LIKE ? OR description LIKE ? OR id LIKE ?)")
-		pattern := "%" + query + "%"
-		args = append(args, pattern, pattern, pattern)
-	}
-
-	if filter.Status != nil {
-		whereClauses = append(whereClauses, "status = ?")
-		args = append(args, *filter.Status)
-	}
-
-	if len(filter.ExcludeStatus) > 0 {
-		placeholders := make([]string, len(filter.ExcludeStatus))
-		for i, s := range filter.ExcludeStatus {
-			placeholders[i] = "?"
-			args = append(args, string(s))
-		}
-		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
-	}
-
-	if filter.IssueType != nil {
-		whereClauses = append(whereClauses, "issue_type = ?")
-		args = append(args, *filter.IssueType)
-	}
-
-	if len(filter.ExcludeTypes) > 0 {
-		placeholders := make([]string, len(filter.ExcludeTypes))
-		for i, t := range filter.ExcludeTypes {
-			placeholders[i] = "?"
-			args = append(args, string(t))
-		}
-		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
-	}
-
-	if filter.Assignee != nil {
-		whereClauses = append(whereClauses, "assignee = ?")
-		args = append(args, *filter.Assignee)
-	}
-
-	if filter.Priority != nil {
-		whereClauses = append(whereClauses, "priority = ?")
-		args = append(args, *filter.Priority)
-	}
-
-	if len(filter.IDs) > 0 {
-		placeholders := make([]string, len(filter.IDs))
-		for i, id := range filter.IDs {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
-		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
-	}
-
-	if filter.IDPrefix != "" {
-		whereClauses = append(whereClauses, "id LIKE ?")
-		args = append(args, filter.IDPrefix+"%")
-	}
-
-	if filter.SpecIDPrefix != "" {
-		whereClauses = append(whereClauses, "spec_id LIKE ?")
-		args = append(args, filter.SpecIDPrefix+"%")
-	}
-
-	if filter.ParentID != nil {
-		parentID := *filter.ParentID
-		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM wisp_dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR (id LIKE CONCAT(?, '.%') AND id NOT IN (SELECT issue_id FROM wisp_dependencies WHERE type = 'parent-child')))")
-		args = append(args, parentID, parentID)
-	}
-
-	if filter.MolType != nil {
-		whereClauses = append(whereClauses, "mol_type = ?")
-		args = append(args, string(*filter.MolType))
-	}
-
-	if filter.WispType != nil {
-		whereClauses = append(whereClauses, "wisp_type = ?")
-		args = append(args, string(*filter.WispType))
-	}
-
-	if filter.TitleSearch != "" {
-		whereClauses = append(whereClauses, "title LIKE ?")
-		args = append(args, "%"+filter.TitleSearch+"%")
-	}
-
-	if filter.TitleContains != "" {
-		whereClauses = append(whereClauses, "title LIKE ?")
-		args = append(args, "%"+filter.TitleContains+"%")
-	}
-
-	if len(filter.Labels) > 0 {
-		for _, label := range filter.Labels {
-			whereClauses = append(whereClauses, "id IN (SELECT issue_id FROM wisp_labels WHERE label = ?)")
-			args = append(args, label)
-		}
-	}
-
-	if len(filter.LabelsAny) > 0 {
-		placeholders := make([]string, len(filter.LabelsAny))
-		for i, label := range filter.LabelsAny {
-			placeholders[i] = "?"
-			args = append(args, label)
-		}
-		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM wisp_labels WHERE label IN (%s))", strings.Join(placeholders, ", ")))
-	}
-
-	if filter.Pinned != nil {
-		if *filter.Pinned {
-			whereClauses = append(whereClauses, "pinned = 1")
-		} else {
-			whereClauses = append(whereClauses, "(pinned = 0 OR pinned IS NULL)")
-		}
-	}
-
-	if filter.SourceRepo != nil {
-		whereClauses = append(whereClauses, "source_repo = ?")
-		args = append(args, *filter.SourceRepo)
-	}
-
-	if filter.DescriptionContains != "" {
-		whereClauses = append(whereClauses, "description LIKE ?")
-		args = append(args, "%"+filter.DescriptionContains+"%")
-	}
-	if filter.NotesContains != "" {
-		whereClauses = append(whereClauses, "notes LIKE ?")
-		args = append(args, "%"+filter.NotesContains+"%")
-	}
-
-	// Priority range filters
-	if filter.PriorityMin != nil {
-		whereClauses = append(whereClauses, "priority >= ?")
-		args = append(args, *filter.PriorityMin)
-	}
-	if filter.PriorityMax != nil {
-		whereClauses = append(whereClauses, "priority <= ?")
-		args = append(args, *filter.PriorityMax)
-	}
-
-	// Date range filters
-	if filter.CreatedAfter != nil {
-		whereClauses = append(whereClauses, "created_at > ?")
-		args = append(args, filter.CreatedAfter.Format(time.RFC3339))
-	}
-	if filter.CreatedBefore != nil {
-		whereClauses = append(whereClauses, "created_at < ?")
-		args = append(args, filter.CreatedBefore.Format(time.RFC3339))
-	}
-	if filter.UpdatedAfter != nil {
-		whereClauses = append(whereClauses, "updated_at > ?")
-		args = append(args, filter.UpdatedAfter.Format(time.RFC3339))
-	}
-	if filter.UpdatedBefore != nil {
-		whereClauses = append(whereClauses, "updated_at < ?")
-		args = append(args, filter.UpdatedBefore.Format(time.RFC3339))
-	}
-	if filter.ClosedAfter != nil {
-		whereClauses = append(whereClauses, "closed_at > ?")
-		args = append(args, filter.ClosedAfter.Format(time.RFC3339))
-	}
-	if filter.ClosedBefore != nil {
-		whereClauses = append(whereClauses, "closed_at < ?")
-		args = append(args, filter.ClosedBefore.Format(time.RFC3339))
-	}
-	if filter.DeferAfter != nil {
-		whereClauses = append(whereClauses, "defer_until > ?")
-		args = append(args, filter.DeferAfter.Format(time.RFC3339))
-	}
-	if filter.DeferBefore != nil {
-		whereClauses = append(whereClauses, "defer_until < ?")
-		args = append(args, filter.DeferBefore.Format(time.RFC3339))
-	}
-	if filter.DueAfter != nil {
-		whereClauses = append(whereClauses, "due_at > ?")
-		args = append(args, filter.DueAfter.Format(time.RFC3339))
-	}
-	if filter.DueBefore != nil {
-		whereClauses = append(whereClauses, "due_at < ?")
-		args = append(args, filter.DueBefore.Format(time.RFC3339))
-	}
-
-	// Empty/null checks
-	if filter.EmptyDescription {
-		whereClauses = append(whereClauses, "(description IS NULL OR description = '')")
-	}
-	if filter.NoAssignee {
-		whereClauses = append(whereClauses, "(assignee IS NULL OR assignee = '')")
-	}
-	if filter.NoLabels {
-		whereClauses = append(whereClauses, "id NOT IN (SELECT DISTINCT issue_id FROM wisp_labels)")
-	}
-
-	// Template filtering
-	if filter.IsTemplate != nil {
-		if *filter.IsTemplate {
-			whereClauses = append(whereClauses, "is_template = 1")
-		} else {
-			whereClauses = append(whereClauses, "(is_template = 0 OR is_template IS NULL)")
-		}
-	}
-
-	// No-parent filtering
-	if filter.NoParent {
-		whereClauses = append(whereClauses, "id NOT IN (SELECT issue_id FROM wisp_dependencies WHERE type = 'parent-child')")
-	}
-
-	// Time-based scheduling filters
-	if filter.Deferred {
-		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
-	}
-	if filter.Overdue {
-		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")
-		args = append(args, time.Now().UTC().Format(time.RFC3339), types.StatusClosed)
+	whereClauses, args, err := buildIssueFilterClauses(query, filter, wispsFilterTables)
+	if err != nil {
+		return nil, err
 	}
 
 	whereSQL := ""
@@ -895,6 +686,33 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Cycle detection for blocking dependency types: check if adding this edge
+	// would create a cycle. UNIONs both tables to detect cross-table cycles
+	// (e.g., wisp A -> permanent B -> wisp A). (bd-xe27)
+	if dep.Type == types.DepBlocks {
+		var reachable int
+		if err := tx.QueryRowContext(ctx, `
+			WITH RECURSIVE reachable AS (
+				SELECT ? AS node, 0 AS depth
+				UNION ALL
+				SELECT d.depends_on_id, r.depth + 1
+				FROM reachable r
+				JOIN (
+					SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'
+					UNION ALL
+					SELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'
+				) d ON d.issue_id = r.node
+				WHERE r.depth < 100
+			)
+			SELECT COUNT(*) FROM reachable WHERE node = ?
+		`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
+			return fmt.Errorf("failed to check for dependency cycle: %w", err)
+		}
+		if reachable > 0 {
+			return fmt.Errorf("adding dependency would create a cycle")
+		}
+	}
+
 	// Check for existing dependency to prevent silent type overwrites.
 	var existingType string
 	err = tx.QueryRowContext(ctx, `
@@ -902,12 +720,17 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 	`, dep.IssueID, dep.DependsOnID).Scan(&existingType)
 	if err == nil {
 		if existingType == string(dep.Type) {
+			// Same type — idempotent; update metadata in case it changed
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE wisp_dependencies SET metadata = ? WHERE issue_id = ? AND depends_on_id = ?
+			`, metadata, dep.IssueID, dep.DependsOnID); err != nil {
+				return fmt.Errorf("failed to update wisp dependency metadata: %w", err)
+			}
 			return wrapTransactionError("commit add wisp dependency", tx.Commit())
 		}
 		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
 			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
-	}
-	if err != nil && err != sql.ErrNoRows {
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing wisp dependency: %w", err)
 	}
 
@@ -1113,23 +936,45 @@ func (s *DoltStore) getWispDependentsWithMetadata(ctx context.Context, issueID s
 }
 
 // addWispLabel adds a label to a wisp in the wisp_labels table.
-func (s *DoltStore) addWispLabel(ctx context.Context, issueID, label, _ string) error {
-	_, err := s.execContext(ctx, `
+func (s *DoltStore) addWispLabel(ctx context.Context, issueID, label, actor string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT IGNORE INTO wisp_labels (issue_id, label) VALUES (?, ?)
 	`, issueID, label)
 	if err != nil {
 		return fmt.Errorf("failed to add wisp label: %w", err)
 	}
-	return nil
+
+	if err := recordEventInTable(ctx, tx, "wisp_events", issueID, types.EventLabelAdded, actor, "Added label: "+label); err != nil {
+		return fmt.Errorf("failed to record wisp label event: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // removeWispLabel removes a label from a wisp.
-func (s *DoltStore) removeWispLabel(ctx context.Context, issueID, label string) error {
-	_, err := s.execContext(ctx, `
+func (s *DoltStore) removeWispLabel(ctx context.Context, issueID, label, actor string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 		DELETE FROM wisp_labels WHERE issue_id = ? AND label = ?
 	`, issueID, label)
 	if err != nil {
 		return fmt.Errorf("failed to remove wisp label: %w", err)
 	}
-	return nil
+
+	if err := recordEventInTable(ctx, tx, "wisp_events", issueID, types.EventLabelRemoved, actor, "Removed label: "+label); err != nil {
+		return fmt.Errorf("failed to record wisp label event: %w", err)
+	}
+
+	return tx.Commit()
 }

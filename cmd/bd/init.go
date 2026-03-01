@@ -473,6 +473,14 @@ environment variable.`,
 				// Non-fatal - continue anyway
 			}
 
+			// In stealth mode, persist no-git-ops: true so bd prime
+			// automatically uses stealth session-close protocol (GH#2159)
+			if stealth {
+				if err := config.SaveConfigValue("no-git-ops", true, beadsDir); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to set no-git-ops in config: %v\n", err)
+				}
+			}
+
 			// Create README.md
 			if err := createReadme(beadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create README.md: %v\n", err)
@@ -636,16 +644,11 @@ environment variable.`,
 				}
 			} else if isGitRepo() {
 				// Regular git repo - install hooks to .beads/hooks/
-				embeddedHooks, err := getEmbeddedHooks()
-				if err == nil {
-					if err := installHooksWithOptions(embeddedHooks, false, false, false, true); err != nil && !quiet {
-						fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks to .beads/hooks/: %v\n", ui.RenderWarn("⚠"), err)
-						fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd hooks install --beads"))
-					} else if !quiet {
-						fmt.Printf("  Hooks installed to: .beads/hooks/\n")
-					}
+				if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "\n%s Failed to install git hooks to .beads/hooks/: %v\n", ui.RenderWarn("⚠"), err)
+					fmt.Fprintf(os.Stderr, "You can try again with: %s\n\n", ui.RenderAccent("bd hooks install --beads"))
 				} else if !quiet {
-					fmt.Fprintf(os.Stderr, "\n%s Failed to load embedded hooks: %v\n", ui.RenderWarn("⚠"), err)
+					fmt.Printf("  Hooks installed to: .beads/hooks/\n")
 				}
 			}
 		}
@@ -870,7 +873,7 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 			location := doltPath
 			if cfg.IsDoltServerMode() {
 				host := cfg.GetDoltServerHost()
-				port := cfg.GetDoltServerPort()
+				port := doltserver.DefaultConfig(beadsDir).Port
 				location = fmt.Sprintf("dolt server at %s:%d", host, port)
 			}
 			return fmt.Errorf(`

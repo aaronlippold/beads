@@ -75,7 +75,8 @@ type DoltStore struct {
 	closed   atomic.Bool  // Tracks whether Close() has been called
 	connStr  string       // Connection string for reconnection
 	mu       sync.RWMutex // Protects concurrent access
-	readOnly bool         // True if opened in read-only mode
+	readOnly      bool   // True if opened in read-only mode
+	credentialKey []byte // Random encryption key for federation credentials
 
 	// Per-invocation caches (lifetime = DoltStore lifetime)
 	customStatusCache  []string        // cached result of GetCustomStatuses
@@ -143,6 +144,11 @@ type Config struct {
 	// Set to 1 for branch isolation in tests (DOLT_CHECKOUT is session-level).
 	MaxOpenConns int
 }
+
+// cliExecTimeout is the maximum time to wait for dolt CLI push/pull operations.
+// SSH transfers can hang indefinitely on network issues or SSH key prompts;
+// this prevents the process from blocking forever.
+const cliExecTimeout = 5 * time.Minute
 
 // Retry configuration for transient connection errors (stale pool connections,
 // brief network issues, server restarts).
@@ -390,6 +396,13 @@ func (s *DoltStore) execContext(ctx context.Context, query string, args ...any) 
 // Use sparingly — prefer the store's typed methods for normal operations.
 func (s *DoltStore) DB() *sql.DB {
 	return s.db
+}
+
+// QueryContext wraps s.db.QueryContext with retry for transient errors.
+// Exported so callers (e.g. backup) can run ad-hoc queries with retry
+// instead of going through the raw *sql.DB.
+func (s *DoltStore) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.queryContext(ctx, query, args...)
 }
 
 // queryContext wraps s.db.QueryContext with retry for transient errors.
@@ -662,6 +675,14 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			return nil
 		}, backoff.WithContext(schemaBO, ctx)); err != nil {
 			return nil, fmt.Errorf("failed to initialize schema: %w", err)
+		}
+	}
+
+	// Initialize credential encryption key (loads from file or generates new random key).
+	// This must run after schema init so federation_peers table exists for migration.
+	if !cfg.ReadOnly {
+		if err := store.initCredentialKey(ctx); err != nil {
+			return nil, fmt.Errorf("failed to initialize credential key: %w", err)
 		}
 	}
 
@@ -1224,9 +1245,66 @@ func (s *DoltStore) buildBatchCommitMessage(ctx context.Context, actor string) s
 	return msg
 }
 
+// isSSHRemote checks whether the configured remote URL uses SSH transport.
+// SSH remotes (git+ssh://, ssh://, git@host:path) require CLI-based push/pull
+// because CALL DOLT_PUSH through the SQL server times out — the MySQL connection
+// drops before the SSH transfer completes.
+func (s *DoltStore) isSSHRemote(ctx context.Context) bool {
+	// Check SQL remotes first
+	remotes, err := s.ListRemotes(ctx)
+	if err == nil {
+		for _, r := range remotes {
+			if r.Name == s.remote {
+				return doltutil.IsSSHURL(r.URL)
+			}
+		}
+	}
+	// Fall back to CLI remotes (covers drift where remote exists only in filesystem)
+	if s.dbPath != "" {
+		if url := doltutil.FindCLIRemote(s.dbPath, s.remote); url != "" {
+			return doltutil.IsSSHURL(url)
+		}
+	}
+	return false
+}
+
+// doltCLIPush shells out to `dolt push` from the database directory.
+// Used for SSH remotes where CALL DOLT_PUSH times out through the SQL connection.
+func (s *DoltStore) doltCLIPush(ctx context.Context, force bool) error {
+	ctx, cancel := context.WithTimeout(ctx, cliExecTimeout)
+	defer cancel()
+	args := []string{"push"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, s.remote, s.branch)
+	cmd := exec.CommandContext(ctx, "dolt", args...) // #nosec G204 -- fixed command with validated remote/branch
+	cmd.Dir = s.dbPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dolt push failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// doltCLIPull shells out to `dolt pull` from the database directory.
+// Used for SSH remotes where CALL DOLT_PULL times out through the SQL connection.
+func (s *DoltStore) doltCLIPull(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, cliExecTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "dolt", "pull", s.remote, s.branch) // #nosec G204 -- fixed command
+	cmd.Dir = s.dbPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dolt pull failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // Push pushes commits to the remote.
-// When remote credentials are configured (for Hosted Dolt), sets DOLT_REMOTE_PASSWORD
-// env var and passes --user flag to authenticate.
+// For SSH remotes (including Hosted Dolt SSH), uses CLI `dolt push` to avoid MySQL connection timeouts.
+// For non-SSH Hosted Dolt (remoteUser set), uses CALL DOLT_PUSH with --user authentication.
+// For other remotes (DoltHub, S3, GCS, file), uses CALL DOLT_PUSH via SQL.
 func (s *DoltStore) Push(ctx context.Context) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.push",
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -1236,6 +1314,20 @@ func (s *DoltStore) Push(ctx context.Context) (retErr error) {
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
+	// SSH remotes: use CLI to avoid MySQL connection timeout during transfer.
+	// Must check before remoteUser — Hosted Dolt SSH remotes have remoteUser set
+	// but still need CLI to avoid SQL connection timeout.
+	if s.isSSHRemote(ctx) {
+		if s.remoteUser != "" {
+			federationEnvMutex.Lock()
+			cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
+			defer func() {
+				cleanup()
+				federationEnvMutex.Unlock()
+			}()
+		}
+		return s.doltCLIPush(ctx, false)
+	}
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
@@ -1258,6 +1350,7 @@ func (s *DoltStore) Push(ctx context.Context) (retErr error) {
 
 // ForcePush force-pushes commits to the remote, overwriting remote changes.
 // Use when the remote has uncommitted changes in its working set.
+// For SSH remotes (including Hosted Dolt SSH), uses CLI `dolt push --force` to avoid MySQL connection timeouts.
 func (s *DoltStore) ForcePush(ctx context.Context) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.force_push",
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -1267,6 +1360,20 @@ func (s *DoltStore) ForcePush(ctx context.Context) (retErr error) {
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
+	// SSH remotes: use CLI to avoid MySQL connection timeout during transfer.
+	// Must check before remoteUser — Hosted Dolt SSH remotes have remoteUser set
+	// but still need CLI to avoid SQL connection timeout.
+	if s.isSSHRemote(ctx) {
+		if s.remoteUser != "" {
+			federationEnvMutex.Lock()
+			cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
+			defer func() {
+				cleanup()
+				federationEnvMutex.Unlock()
+			}()
+		}
+		return s.doltCLIPush(ctx, true)
+	}
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
@@ -1289,8 +1396,8 @@ func (s *DoltStore) ForcePush(ctx context.Context) (retErr error) {
 
 // Pull pulls changes from the remote.
 // Passes branch explicitly to avoid "did not specify a branch" errors.
-// When remote credentials are configured (for Hosted Dolt), sets DOLT_REMOTE_PASSWORD
-// env var and passes --user flag to authenticate.
+// For SSH remotes (including Hosted Dolt SSH), uses CLI `dolt pull` to avoid MySQL connection timeouts.
+// For non-SSH Hosted Dolt (remoteUser set), uses CALL DOLT_PULL with --user authentication.
 func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 	ctx, span := doltTracer.Start(ctx, "dolt.pull",
 		trace.WithSpanKind(trace.SpanKindClient),
@@ -1300,6 +1407,26 @@ func (s *DoltStore) Pull(ctx context.Context) (retErr error) {
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
+	// SSH remotes: use CLI to avoid MySQL connection timeout during transfer.
+	// Must check before remoteUser — Hosted Dolt SSH remotes have remoteUser set
+	// but still need CLI to avoid SQL connection timeout.
+	if s.isSSHRemote(ctx) {
+		if s.remoteUser != "" {
+			federationEnvMutex.Lock()
+			cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)
+			defer func() {
+				cleanup()
+				federationEnvMutex.Unlock()
+			}()
+		}
+		if err := s.doltCLIPull(ctx); err != nil {
+			return err
+		}
+		if err := s.resetAutoIncrements(ctx); err != nil {
+			return fmt.Errorf("failed to reset auto-increments after pull: %w", err)
+		}
+		return nil
+	}
 	if s.remoteUser != "" {
 		federationEnvMutex.Lock()
 		cleanup := setFederationCredentials(s.remoteUser, s.remotePassword)

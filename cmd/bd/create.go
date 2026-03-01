@@ -79,8 +79,8 @@ var createCmd = &cobra.Command{
 		if isTestIssue(title) && !silent && !debug.IsQuiet() {
 			fmt.Fprintf(os.Stderr, "%s Creating test issue in production database\n", ui.RenderWarn("⚠"))
 			fmt.Fprintf(os.Stderr, "  Title: %q appears to be test data\n", title)
-			fmt.Fprintf(os.Stderr, "  Recommendation: Use isolated test database with BEADS_DB\n")
-			fmt.Fprintf(os.Stderr, "    BEADS_DB=/tmp/test.db ./bd create %q\n", title)
+			fmt.Fprintf(os.Stderr, "  Recommendation: Use isolated test database with --db\n")
+			fmt.Fprintf(os.Stderr, "    bd --db /tmp/test-beads create %q\n", title)
 		}
 
 		// Get field values
@@ -1036,15 +1036,12 @@ func formatTimeForRPC(t *time.Time) string {
 // the same prefix as the source store (T010, T012: prefix inheritance).
 func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *dolt.DoltStore) error {
 	beadsDir := filepath.Join(targetPath, ".beads")
-	dbPath := filepath.Join(beadsDir, "beads.db")
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
 
-	// Check if beads directory already exists
-	if _, err := os.Stat(beadsDir); err == nil {
-		// Directory exists, check if database exists
-		if _, err := os.Stat(dbPath); err == nil {
-			// Database exists, nothing to do
-			return nil
-		}
+	// Check if beads directory already exists with a Dolt database.
+	// metadata.json is the canonical marker for an initialized beads dir.
+	if _, err := os.Stat(metadataPath); err == nil {
+		return nil
 	}
 
 	// Create .beads directory
@@ -1052,13 +1049,13 @@ func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *
 		return fmt.Errorf("cannot create .beads directory: %w", err)
 	}
 
-	// Initialize database - it will be created when dolt.New is called
-	// But we need to set the prefix if source store has one (T012: prefix inheritance)
+	// Initialize database via NewFromConfigWithOptions to respect Dolt config.
+	// Set the prefix if source store has one (T012: prefix inheritance).
 	if sourceStore != nil {
 		sourcePrefix, err := sourceStore.GetConfig(ctx, "issue_prefix")
 		if err == nil && sourcePrefix != "" {
 			// Open target store temporarily to set prefix
-			tempStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath, CreateIfMissing: true})
+			tempStore, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{CreateIfMissing: true})
 			if err != nil {
 				return fmt.Errorf("failed to initialize target database: %w", err)
 			}

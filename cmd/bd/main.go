@@ -31,12 +31,6 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-// Command group IDs for help organization
-const (
-	GroupMaintenance  = "maintenance"
-	GroupIntegrations = "integrations"
-)
-
 var (
 	dbPath     string
 	actor      string
@@ -184,12 +178,6 @@ func init() {
 	if err := config.Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
 	}
-
-	// Add command groups for organized help output
-	rootCmd.AddGroup(
-		&cobra.Group{ID: GroupMaintenance, Title: "Maintenance:"},
-		&cobra.Group{ID: GroupIntegrations, Title: "Integrations & Advanced:"},
-	)
 
 	// Register persistent flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
@@ -660,8 +648,12 @@ var rootCmd = &cobra.Command{
 		// Auto-backup: export JSONL to .beads/backup/ if enabled and due
 		maybeAutoBackup(rootCtx)
 
-		// Auto-push: push to Dolt remote if enabled and due
-		maybeAutoPush(rootCtx)
+		// Auto-push: push to Dolt remote if enabled and due.
+		// Skip for read-only commands to avoid unnecessary network operations
+		// and metadata writes on commands like bd list/show/ready (GH#2191).
+		if !isReadOnlyCommand(cmd.Name()) {
+			maybeAutoPush(rootCtx)
+		}
 
 		// Signal that store is closing (prevents background flush from accessing closed store)
 		storeMutex.Lock()

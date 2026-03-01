@@ -24,6 +24,9 @@ func (s *DoltStore) UpdateIssueID(ctx context.Context, oldID, newID string, issu
 	if err != nil {
 		return fmt.Errorf("failed to disable foreign key checks: %w", err)
 	}
+	// SET is session-level, not rolled back by tx.Rollback(). Ensure FK checks
+	// are re-enabled on the connection even if we return early on error.
+	defer func() { _, _ = tx.ExecContext(ctx, `SET FOREIGN_KEY_CHECKS = 1`) }()
 
 	// Update the issue itself
 	result, err := tx.ExecContext(ctx, `
@@ -88,6 +91,32 @@ func (s *DoltStore) UpdateIssueID(ctx context.Context, oldID, newID string, issu
 	_, err = tx.ExecContext(ctx, `UPDATE child_counters SET parent_id = ? WHERE parent_id = ?`, newID, oldID)
 	if err != nil {
 		return fmt.Errorf("failed to update child_counters: %w", err)
+	}
+
+	// Update references in wisp tables
+	_, err = tx.ExecContext(ctx, `UPDATE wisp_dependencies SET issue_id = ? WHERE issue_id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to update issue_id in wisp_dependencies: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE wisp_dependencies SET depends_on_id = ? WHERE depends_on_id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to update depends_on_id in wisp_dependencies: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE wisp_events SET issue_id = ? WHERE issue_id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to update wisp_events: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE wisp_labels SET issue_id = ? WHERE issue_id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to update wisp_labels: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE wisp_comments SET issue_id = ? WHERE issue_id = ?`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("failed to update wisp_comments: %w", err)
 	}
 
 	// Record rename event
